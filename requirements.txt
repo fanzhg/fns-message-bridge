@@ -1,0 +1,5 @@
+requests==2.34.2
+dingtalk-stream==0.24.3
+websockets==15.0.1
+protobuf==6.33.0
+tzdata==2025.2

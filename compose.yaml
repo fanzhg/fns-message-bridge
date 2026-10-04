@@ -1,0 +1,40 @@
+name: fns-message-bridge
+
+services:
+  bridge:
+    build: .
+    image: fns-message-bridge:local
+    restart: unless-stopped
+    init: true
+    # Entire bridge container, including all three channels.
+    mem_limit: ${BRIDGE_MEMORY_LIMIT:-128m}
+    memswap_limit: ${BRIDGE_MEMORY_LIMIT:-128m}
+    cpus: 0.25
+    pids_limit: 64
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - type: bind
+        source: ./config.toml
+        target: /config/config.toml
+        read_only: true
+        bind:
+          create_host_path: false
+      - queue:/data
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+    healthcheck:
+      test: [CMD, python, -c, "import os,time; assert time.time()-os.stat('/tmp/bridge-health').st_mtime<60"]
+      interval: 60s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+volumes:
+  queue:

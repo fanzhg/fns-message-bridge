@@ -1,0 +1,5 @@
+*
+!Dockerfile
+!requirements.txt
+!bridge.py
+!feishu_lite.py

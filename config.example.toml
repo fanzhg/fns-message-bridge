@@ -1,0 +1,32 @@
+[fns]
+url = "https://fns.example.com"
+vault = "your-vault"
+# 在 FNS 管理后台生成独立 API Token，协议 rest，客户端 fns-message-bridge，
+# 功能 note_r,note_w，限制目标仓库。不要填网页登录 Token。
+token = ""
+client = "fns-message-bridge"
+
+[capture]
+folder = "Inbox"
+timezone = "Asia/Shanghai"
+state_dir = "/data"
+
+[telegram]
+enabled = false
+bot_token = ""
+# 数字用户 ID，也可写成字符串。发 /whoami 给机器人查询。
+allowed_users = []
+
+[dingtalk]
+enabled = false
+client_id = ""
+client_secret = ""
+# 优先使用 senderStaffId；发 身份 给机器人查询。
+allowed_users = []
+
+[feishu]
+enabled = false
+app_id = ""
+app_secret = ""
+# open_id，形如 ou_xxx；发 身份 给机器人查询。
+allowed_users = []
