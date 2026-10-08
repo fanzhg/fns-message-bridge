@@ -167,7 +167,7 @@ def simulated_http(method, url, **kwargs):
     if url == "https://api.dingtalk.com/v1.0/robot/messageFiles/download":
         assert kwargs["json"] == {"downloadCode": "ding-image", "robotCode": "dummy"}
         assert kwargs["headers"]["x-acs-dingtalk-access-token"] == "dummy"
-        return {"downloadUrl": "https://images.example.test/ding"}
+        return {"downloadUrl": "http://images.example.test/ding"}
     if "open.feishu.cn/open-apis/auth" in url:
         return {"code": 0, "tenant_access_token": "dummy", "expire": 7200}
     if "open.feishu.cn/open-apis/im" in url:
@@ -184,7 +184,9 @@ def simulated_get(url, **kwargs):
         assert url.endswith("/photos/image.png")
     elif "/messages/om_1/resources/img1?type=image" in url:
         assert kwargs["headers"] == {"Authorization": "Bearer dummy"}
-    elif url != "https://images.example.test/ding":
+    elif url == "http://images.example.test/ding":
+        assert not kwargs["headers"]
+    else:
         raise AssertionError("Unexpected image network request")
     return real_get(f"http://127.0.0.1:{server.server_port}/image", **kwargs)
 

@@ -1,5 +1,16 @@
 # 验证记录
 
+## v0.2.1 钉钉 HTTP 图片链接修复（2026-10-08）
+
+- 用户诊断确认：钉钉 API 返回的临时下载链接使用 HTTP，v0.2.0 的 HTTPS 校验将其拒绝。
+- 仅为钉钉图片允许 HTTP，临时链接请求不携带应用 Token；Telegram、飞书仍要求 HTTPS。允许 HTTP 不再同时放开私网地址校验；FNS 私网内容校验显式保留原有支持。
+- 新增覆盖 HTTP 图片保存、HTTP → HTTPS 重定向、重定向到内网或携带账号密码的地址被拒绝、鉴权下载禁止 HTTPS → HTTP，以及 FNS 私网 HTTP 内容校验兼容。
+- Windows Python 3.12.14 和 Linux Docker 中，57 项测试通过。
+- 非 root、只读、128 MiB 且不额外使用 swap 的容器内，三平台模拟流程通过：3 张图片、3 篇 MD、3 次成功回复和 2 次回调 ACK。钉钉模拟 API 返回 HTTP 临时链接。
+- 模拟结束 RSS 51,916 kB，约 51 MiB；不代表实际长时间运行或大图负载的峰值。
+
+未使用真实钉钉/FNS 凭证验证，未连接或更新用户 VPS。主机校验针对 localhost、.local 及私网 IP 字面量，不对 API 返回的域名做 DNS 地址解析。
+
 ## v0.2.0 图片版（2026-10-08）
 
 - TG 照片/图片文件、钉钉 picture/richText、飞书 image/post 消息解析已验证。

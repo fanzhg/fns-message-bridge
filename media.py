@@ -18,13 +18,13 @@ class DownloadError(Exception):
     pass
 
 
-def validate_url(url, allow_http=False):
+def validate_url(url, allow_http=False, allow_private=False):
     parsed = urlparse(url)
     if parsed.scheme not in (("https", "http") if allow_http else ("https",)) or not parsed.hostname:
         raise DownloadError("Invalid download URL")
     if parsed.username or parsed.password or parsed.fragment:
         raise DownloadError("Invalid download URL")
-    if not allow_http:
+    if not allow_private:
         if parsed.hostname == "localhost" or parsed.hostname.endswith(".local"):
             raise DownloadError("Invalid download host")
         try:
@@ -36,13 +36,15 @@ def validate_url(url, allow_http=False):
                 raise DownloadError("Invalid download host")
 
 
-def chunks(url, limit, headers=None, allow_http=False):
+def chunks(url, limit, headers=None, allow_http=False, allow_private=False):
     # Validate redirects ourselves so a bearer token cannot escape to another host.
-    original = urlparse(url).netloc
+    original = urlparse(url)
     try:
         for redirect in range(4):
-            validate_url(url, allow_http)
-            if headers and urlparse(url).netloc != original:
+            validate_url(url, allow_http, allow_private)
+            parsed = urlparse(url)
+            if headers and (parsed.netloc != original.netloc or
+                            (original.scheme == "https" and parsed.scheme != "https")):
                 raise DownloadError("Authenticated download redirected to another host")
             with requests.get(url, headers=headers, stream=True, timeout=(10, 60),
                               allow_redirects=False) as response:
@@ -96,12 +98,12 @@ def inspect_image(path, limit):
     raise MediaRejected("仅支持 JPEG、PNG、GIF、WebP、BMP 图片")
 
 
-def download_image(url, destination, limit, headers=None):
+def download_image(url, destination, limit, headers=None, *, allow_http=False):
     destination = Path(destination)
     partial = destination.with_suffix(".part")
     try:
         with partial.open("wb") as output:
-            for chunk in chunks(url, limit, headers):
+            for chunk in chunks(url, limit, headers, allow_http=allow_http):
                 output.write(chunk)
             output.flush()
             os.fsync(output.fileno())
@@ -118,7 +120,8 @@ def file_digest(path):
 
 def remote_digest(url, limit, headers):
     digest = hashlib.sha256()
-    for chunk in chunks(url, limit, headers, allow_http=True):
+    # FNS is configured by the operator and may be hosted on a private network.
+    for chunk in chunks(url, limit, headers, allow_http=True, allow_private=True):
         digest.update(chunk)
     return digest.hexdigest()
 
@@ -168,4 +171,6 @@ class ImageDownloader:
             url = "https://open.feishu.cn/open-apis/im/v1/messages/" + quote(item["message_id"], safe="")
             url += "/resources/" + quote(item["image_key"], safe="") + "?type=image"
             headers = {"Authorization": "Bearer " + self.feishu_client.tenant_token()}
-        download_image(url, destination, limit, headers)
+        # DingTalk's authenticated lookup can return an HTTP temporary CDN URL.
+        # Send no application credentials to that URL; keep host checks enabled.
+        download_image(url, destination, limit, headers, allow_http=self.source == "dingtalk")

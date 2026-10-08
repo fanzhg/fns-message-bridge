@@ -204,8 +204,8 @@ class FNS:
     def headers(self):
         return {"Token": self.config["token"],
                    "X-Client": self.config.get("client", "fns-message-bridge"),
-                   "X-Client-Name": "FNS Message Bridge", "X-Client-Version": "0.2.0",
-                   "User-Agent": "fns-message-bridge/0.2.0"}
+                   "X-Client-Name": "FNS Message Bridge", "X-Client-Version": "0.2.1",
+                   "User-Agent": "fns-message-bridge/0.2.1"}
 
     def upload_image(self, path, local, mime, limit):
         # FNS 3.6.1 has no createOnly for files; inspect existing content before POST.

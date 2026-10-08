@@ -99,8 +99,56 @@ class DownloadTests(unittest.TestCase):
                 self.assertEqual(download.call_args.args[3], {"Authorization": "Bearer tenant"})
             elif source == "dingtalk":
                 self.assertEqual(http.call_args.kwargs["json"], {"robotCode": "robot", "downloadCode": "code"})
+                self.assertTrue(download.call_args.kwargs["allow_http"])
             else:
                 self.assertIn("/file/botsecret/photos/image.jpg", download.call_args.args[0])
+                self.assertFalse(download.call_args.kwargs["allow_http"])
+
+    def test_dingtalk_http_url_downloads_without_application_token(self):
+        url = "http://images.example.test/signed?token=temporary"
+        http = Mock(side_effect=[{"accessToken": "secret", "expireIn": 7200}, {"downloadUrl": url}])
+        downloader = media.ImageDownloader("dingtalk", {"client_id": "id", "client_secret": "secret"}, http)
+        with patch("media.requests.get", return_value=self.response()) as get:
+            downloader({"download_code": "code", "robot_code": "robot"}, self.destination, 1024)
+        self.assertEqual(self.destination.read_bytes(), PNG)
+        self.assertEqual(get.call_args.args[0], url)
+        self.assertIsNone(get.call_args.kwargs["headers"])
+
+    def test_dingtalk_http_redirect_still_checks_destination(self):
+        for target in ("http://127.0.0.1/image", "https://localhost/image", "http://user:secret@host.test/image"):
+            with self.subTest(target=target):
+                response = self.response(status=302, headers={"Location": target})
+                with patch("media.requests.get", return_value=response) as get:
+                    with self.assertRaises(media.DownloadError):
+                        media.download_image("http://images.example.test/a", self.destination, 1024, allow_http=True)
+                self.assertEqual(get.call_count, 1)
+                self.assertFalse(self.destination.with_suffix(".part").exists())
+
+    def test_http_to_https_redirect_downloads_image(self):
+        redirect = self.response(status=302, headers={"Location": "https://images.example.test/image?token=temporary"})
+        with patch("media.requests.get", side_effect=[redirect, self.response()]) as get:
+            media.download_image("http://images.example.test/a", self.destination, 1024, allow_http=True)
+        self.assertEqual(self.destination.read_bytes(), PNG)
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(get.call_args.args[0], "https://images.example.test/image?token=temporary")
+
+    def test_http_permission_does_not_allow_private_hosts(self):
+        for url in ("http://127.0.0.1/a", "http://10.0.0.1/a", "http://[::1]/a", "http://localhost/a", "http://host.local/a"):
+            with self.subTest(url=url), self.assertRaises(media.DownloadError):
+                media.validate_url(url, allow_http=True)
+
+    def test_fns_private_http_digest_remains_supported(self):
+        with patch("media.requests.get", return_value=self.response()) as get:
+            digest = media.remote_digest("http://127.0.0.1/api/file", 1024, {"Token": "secret"})
+        self.assertEqual(digest, media.hashlib.sha256(PNG).hexdigest())
+        self.assertEqual(get.call_args.kwargs["headers"], {"Token": "secret"})
+
+    def test_authenticated_https_download_cannot_redirect_to_http(self):
+        response = self.response(status=302, headers={"Location": "http://images.example.test/image"})
+        with patch("media.requests.get", return_value=response) as get:
+            with self.assertRaises(media.DownloadError):
+                list(media.chunks("https://images.example.test/a", 1024, {"Token": "secret"}, allow_http=True))
+        self.assertEqual(get.call_count, 1)
 
 
 class ImageQueueTests(unittest.TestCase):
