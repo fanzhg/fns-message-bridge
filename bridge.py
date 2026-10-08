@@ -1,4 +1,4 @@
-"""Text capture for Fast Note Sync 3.6.1. Python 3.11+."""
+"""Text and image capture for Fast Note Sync 3.6.1. Python 3.11+."""
 from __future__ import annotations
 
 import argparse
@@ -19,6 +19,8 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import requests
+from requests_toolbelt.multipart.encoder import MultipartEncoder
+from media import DownloadError, ImageDownloader, MediaRejected, inspect_image, file_digest, remote_digest
 
 LOG = logging.getLogger("bridge")
 SOURCES = ("telegram", "dingtalk", "feishu")
@@ -55,8 +57,11 @@ def http_json(method, url, **kwargs):
 
 
 def load_config(path):
-    with open(path, "rb") as stream:
-        config = tomllib.load(stream)
+    try:
+        with open(path, "rb") as stream:
+            config = tomllib.load(stream)
+    except tomllib.TOMLDecodeError as exc:
+        raise BridgeError(f"Invalid config.toml: {exc}") from None
     fns = config["fns"]
     for key in ("url", "vault", "token"):
         if not fns.get(key):
@@ -71,11 +76,18 @@ def load_config(path):
     if not folder or any(p in ("", ".", "..") for p in parts) or any(c in folder for c in '\\:*?"<>|'):
         raise BridgeError("capture.folder must be a relative vault folder")
     ZoneInfo(config.get("capture", {}).get("timezone", "Asia/Shanghai"))
+    image_options = config.get("images", {})
+    if type(image_options.get("enabled", True)) is not bool:
+        raise BridgeError("images.enabled must be true or false")
+    for key, default, maximum in (("max_size_mb", 5, 20), ("max_per_message", 10, 20)):
+        value = image_options.get(key, default)
+        if type(value) is not int or not 1 <= value <= maximum:
+            raise BridgeError(f"images.{key} must be an integer between 1 and {maximum}")
     return config
 
 
-def make_note(config, source, message_id, sender, text, timestamp):
-    if source not in SOURCES or not message_id or not text.strip():
+def make_note(config, source, message_id, sender, text, timestamp, attachments=None):
+    if source not in SOURCES or not message_id or not (text.strip() or attachments):
         raise BridgeError("Invalid text message")
     key = hashlib.sha256(f"{source}:{message_id}".encode()).hexdigest()
     capture = config.get("capture", {})
@@ -94,6 +106,7 @@ def make_note(config, source, message_id, sender, text, timestamp):
 class Store:
     """One DB and one running consumer per source; SQLite commits before ACK."""
     def __init__(self, path):
+        self.path = Path(path)
         self.db = sqlite3.connect(path, timeout=30, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.lock = threading.RLock()
@@ -108,9 +121,11 @@ class Store:
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS jobs_path_idx ON jobs(path);
         """)
+        if "attachments" not in {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}:
+            self.db.execute("ALTER TABLE jobs ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'")
         self.db.commit()
 
-    def enqueue(self, key, path, content, reply):
+    def enqueue(self, key, path, content, reply, attachments=None):
         with self.lock, self.db:
             if self.db.execute("SELECT 1 FROM jobs WHERE key=?", (key,)).fetchone():
                 return False
@@ -121,14 +136,14 @@ class Store:
                 path = str(base.with_name(f"{base.stem}-{suffix}{base.suffix}"))
                 suffix += 1
             result = self.db.execute(
-                "INSERT OR IGNORE INTO jobs(key,path,content,reply) VALUES(?,?,?,?)",
-                (key, path, content, json.dumps(reply, ensure_ascii=False)))
+                "INSERT OR IGNORE INTO jobs(key,path,content,reply,attachments) VALUES(?,?,?,?,?)",
+                (key, path, content, json.dumps(reply, ensure_ascii=False), json.dumps(attachments or [])))
             return result.rowcount == 1
 
     def next_job(self):
         with self.lock:
             row = self.db.execute(
-                "SELECT * FROM jobs WHERE state != 'done' AND next_at <= ? ORDER BY rowid LIMIT 1",
+                "SELECT * FROM jobs WHERE state IN ('pending','saved','rejected') AND next_at <= ? ORDER BY rowid LIMIT 1",
                 (time.time(),)).fetchone()
             return dict(row) if row else None
 
@@ -136,14 +151,24 @@ class Store:
         with self.lock, self.db:
             self.db.execute("UPDATE jobs SET state=?,attempts=0,next_at=0,last_error='' WHERE key=?",
                             (state, key))
-            if state == "done":
+            if state in ("done", "rejected_done"):
                 # Keep the dedupe key, discard captured text and transient reply credentials.
-                self.db.execute("UPDATE jobs SET content='',reply='{}' WHERE key=?", (key,))
+                self.db.execute("UPDATE jobs SET content='',reply='{}',attachments='[]' WHERE key=?", (key,))
+
+    def update_media(self, job):
+        with self.lock, self.db:
+            self.db.execute("UPDATE jobs SET attachments=?,content=? WHERE key=?",
+                            (json.dumps(job["media"]), job["content"], job["key"]))
+
+    def reject(self, key, reason):
+        with self.lock, self.db:
+            self.db.execute("UPDATE jobs SET state='rejected',attempts=0,next_at=0,last_error=? WHERE key=?",
+                            (reason, key))
 
     def fail(self, job, error):
         attempts = job["attempts"] + 1
         with self.lock, self.db:
-            self.db.execute("UPDATE jobs SET attempts=?,next_at=?,last_error=? WHERE key=?",
+            self.db.execute("UPDATE jobs SET attempts=?,next_at=?,last_error=CASE WHEN state='rejected' THEN last_error ELSE ? END WHERE key=?",
                             (attempts, time.time() + min(300, 2 ** min(attempts, 8)),
                              str(error), job["key"]))
 
@@ -169,14 +194,41 @@ class FNS:
             self.url = self.url[:-4]
 
     def call(self, method, route, **kwargs):
-        headers = {"Token": self.config["token"],
-                   "X-Client": self.config.get("client", "fns-message-bridge"),
-                   "X-Client-Name": "FNS Message Bridge", "X-Client-Version": "1.0.0",
-                   "User-Agent": "fns-message-bridge/1.0"}
+        headers = self.headers()
+        headers.update(kwargs.pop("headers", {}))
         body = http_json(method, self.url + "/api/" + route, headers=headers, **kwargs)
         if body.get("status") is not True or body.get("code") not in range(1, 7):
             raise ApiError(body.get("code"))
         return body.get("data")
+
+    def headers(self):
+        return {"Token": self.config["token"],
+                   "X-Client": self.config.get("client", "fns-message-bridge"),
+                   "X-Client-Name": "FNS Message Bridge", "X-Client-Version": "0.2.0",
+                   "User-Agent": "fns-message-bridge/0.2.0"}
+
+    def upload_image(self, path, local, mime, limit):
+        # FNS 3.6.1 has no createOnly for files; inspect existing content before POST.
+        for page in range(1, 101):
+            data = self.call("GET", "files", params={"vault": self.config["vault"],
+                "keyword": path, "page": page, "pageSize": 50})
+            if not isinstance(data, dict) or "list" not in data or not isinstance(data["list"], (list, type(None))):
+                raise BridgeError("Invalid FNS file list")
+            rows = data.get("list") or []
+            if any(row.get("path") == path for row in rows):
+                from urllib.parse import urlencode
+                url = self.url + "/api/file?" + urlencode({"vault": self.config["vault"], "path": path})
+                if remote_digest(url, limit, self.headers()) != file_digest(local):
+                    raise MediaRejected("附件路径已被其他内容占用，未覆盖原文件")
+                return
+            if len(rows) < 50:
+                break
+        else:
+            raise BridgeError("FNS file lookup exceeded page limit")
+        with local.open("rb") as stream:
+            body = MultipartEncoder(fields={"vault": self.config["vault"], "path": path,
+                "file": (PurePosixPath(path).name, stream, mime)})
+            self.call("POST", "file", data=body, headers={"Content-Type": body.content_type})
 
     def create(self, job):
         try:
@@ -197,21 +249,77 @@ class FNS:
 
 
 class Bridge:
-    def __init__(self, config, source, store, sender):
+    def __init__(self, config, source, store, sender, downloader=None):
         self.config, self.source, self.store, self.sender = config, source, store, sender
         self.fns = FNS(config["fns"])
         self.allowed = {str(value) for value in config[source].get("allowed_users", [])}
+        self.downloader = downloader
+        self.image_options = config.get("images", {})
+        self.image_limit = self.image_options.get("max_size_mb", 5) * 1024 * 1024
+        self.cache = store.path.parent / "media" / source
 
-    def receive(self, message_id, user_id, text, timestamp, reply):
-        if text.strip() in ("/whoami", "身份"):
+    def receive(self, message_id, user_id, text, timestamp, reply, attachments=None):
+        if not attachments and text.strip() in ("/whoami", "身份"):
             self.sender(reply, f"你的用户 ID：{user_id}")
             return
         if str(user_id) not in self.allowed:
             LOG.warning("Ignored sender outside %s allowlist", self.source)
             return
-        key, path, content = make_note(self.config, self.source, message_id, user_id, text, timestamp)
-        if self.store.enqueue(key, path, content, reply):
+        attachments = attachments or []
+        key, path, content = make_note(self.config, self.source, message_id, user_id, text, timestamp, attachments)
+        if self.store.enqueue(key, path, content, reply, attachments):
             LOG.info("Queued %s %s", self.source, key[:12])
+
+    def cache_file(self, job, index):
+        return self.cache / f'{job["key"]}-{index}.bin'
+
+    def clean_cache(self, job):
+        for index, _ in enumerate(json.loads(job.get("attachments", "[]"))):
+            path = self.cache_file(job, index)
+            path.unlink(missing_ok=True)
+            path.with_suffix(".part").unlink(missing_ok=True)
+
+    def prepare_images(self, job):
+        job["media"] = json.loads(job.get("attachments", "[]"))
+        if not job["media"]:
+            return
+        if not self.image_options.get("enabled", True):
+            raise MediaRejected("图片收集已关闭")
+        if len(job["media"]) > self.image_options.get("max_per_message", 10):
+            raise MediaRejected("单条消息的图片数量超过限制")
+        if any(int(item.get("size") or 0) > self.image_limit for item in job["media"]):
+            raise MediaRejected("图片超过大小限制")
+        self.cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+        note = PurePosixPath(job["path"])
+        # Validate every image before uploading any, preventing partial invalid albums.
+        for index, item in enumerate(job["media"]):
+            if item.get("uploaded"):
+                self.cache_file(job, index).unlink(missing_ok=True)
+                continue
+            local = self.cache_file(job, index)
+            if not local.exists():
+                if self.downloader is None:
+                    raise BridgeError("Image downloader unavailable")
+                self.downloader(item, local, self.image_limit)
+            extension, mime = inspect_image(local, self.image_limit)
+            item["path"] = str(note.parent / "assets" / note.stem / f"{note.stem}-{index + 1:02d}{extension}")
+            self.store.update_media(job)
+        for index, item in enumerate(job["media"]):
+            if item.get("uploaded"):
+                continue
+            local = self.cache_file(job, index)
+            _, mime = inspect_image(local, self.image_limit)
+            self.fns.upload_image(item["path"], local, mime, self.image_limit)
+            item["uploaded"] = True
+            self.store.update_media(job)
+            local.unlink(missing_ok=True)
+        links = "\n".join("![](" + str(PurePosixPath(item["path"]).relative_to(note.parent)) + ")"
+                          for item in job["media"])
+        # Render from the stored original only once, even after failed note POSTs.
+        if not job["media"][0].get("embedded"):
+            job["content"] = job["content"].rstrip() + "\n\n" + links + "\n"
+            job["media"][0]["embedded"] = True
+            self.store.update_media(job)
 
     def deliver_one(self):
         job = self.store.next_job()
@@ -219,19 +327,28 @@ class Bridge:
             return False
         try:
             if job["state"] == "pending":
+                self.prepare_images(job)
                 self.fns.create(job)
                 self.store.state(job["key"], "saved")
                 LOG.info("Saved %s %s", self.source, job["key"][:12])
                 job = dict(job, state="saved", attempts=0)
-            self.sender(json.loads(job["reply"]), "已保存到 Obsidian：" + job["path"])
-            self.store.state(job["key"], "done")
+            rejected = job["state"] == "rejected"
+            self.sender(json.loads(job["reply"]), "图片未保存：" + job["last_error"] if rejected
+                        else "已保存到 Obsidian：" + job["path"])
+            self.clean_cache(job)
+            self.store.state(job["key"], "rejected_done" if rejected else "done")
+        except MediaRejected as exc:
+            LOG.warning("Image rejected %s %s: %s", self.source, job["key"][:12], exc)
+            self.clean_cache(job)
+            self.store.reject(job["key"], str(exc))
         except Exception as exc:
             # Keep the durable job even if SDK or network delivery fails.
-            safe = exc if isinstance(exc, BridgeError) else BridgeError(type(exc).__name__)
+            safe = exc if isinstance(exc, (BridgeError, DownloadError)) else BridgeError(type(exc).__name__)
             LOG.warning("Delivery failed %s %s: %s", self.source, job["key"][:12], safe)
-            if job["state"] == "saved" and job["attempts"] >= 9:
-                LOG.warning("Note saved; acknowledgement abandoned after 10 attempts")
-                self.store.state(job["key"], "done")
+            if job["state"] in ("saved", "rejected") and job["attempts"] >= 9:
+                LOG.warning("Acknowledgement abandoned after 10 attempts")
+                self.clean_cache(job)
+                self.store.state(job["key"], "rejected_done" if job["state"] == "rejected" else "done")
             else:
                 self.store.fail(job, safe)
         return True
@@ -259,32 +376,75 @@ def quiet_sdk(name):
 
 def telegram_message(data):
     message = data.get("message", {})
-    if not message.get("text") or message.get("from", {}).get("is_bot"):
+    if not message or message.get("from", {}).get("is_bot"):
+        return None
+    attachments = []
+    text = message.get("text") or message.get("caption") or ""
+    if message.get("photo"):
+        photo = max(message["photo"], key=lambda image: image.get("width", 0) * image.get("height", 0))
+        attachments.append({"file_id": photo["file_id"], "size": photo.get("file_size", 0)})
+    elif message.get("document", {}).get("mime_type", "").startswith("image/"):
+        document = message["document"]
+        attachments.append({"file_id": document["file_id"], "size": document.get("file_size", 0)})
+    elif not message.get("text"):
         return None
     chat = message["chat"]["id"]
-    return (f'{chat}:{message["message_id"]}', str(message["from"]["id"]),
-            message["text"], message["date"], {"chat_id": chat, "message_id": message["message_id"]})
+    result = (f'{chat}:{message["message_id"]}', str(message["from"]["id"]),
+              text, message["date"], {"chat_id": chat, "message_id": message["message_id"]})
+    return result + (attachments,) if attachments else result
 
 
 def dingtalk_message(data):
-    if data.get("msgtype") != "text" or not data.get("text", {}).get("content", "").strip():
+    kind = data.get("msgtype")
+    if kind not in ("text", "picture", "richText"):
         return None
-    return (data["msgId"], str(data.get("senderStaffId") or data["senderId"]),
-            data["text"]["content"], data["createAt"] / 1000,
-            {"webhook": data["sessionWebhook"], "expires": data["sessionWebhookExpiredTime"]})
+    content = data.get("content") or {}
+    if isinstance(content, str):
+        content = json.loads(content)
+    attachments = []
+    text = data.get("text", {}).get("content", "")
+    parts = [content] if kind == "picture" else content.get("richText", []) if kind == "richText" else []
+    if kind == "richText":
+        text = "\n".join(str(part["text"]) for part in parts if part.get("text"))
+    for part in parts:
+        code = part.get("downloadCode") or part.get("pictureDownloadCode")
+        if code and (kind == "picture" or part.get("type") == "picture" or part.get("pictureDownloadCode")):
+            attachments.append({"download_code": code, "robot_code": data.get("robotCode", "")})
+    if not (text.strip() or attachments):
+        return None
+    result = (data["msgId"], str(data.get("senderStaffId") or data["senderId"]),
+              text, data["createAt"] / 1000,
+              {"webhook": data["sessionWebhook"], "expires": data["sessionWebhookExpiredTime"]})
+    return result + (attachments,) if attachments else result
 
 
 def feishu_message(event):
     message, sender = event["message"], event["sender"]
-    if message.get("message_type") != "text" or sender.get("sender_type") != "user":
+    kind = message.get("message_type")
+    if kind not in ("text", "image", "post") or sender.get("sender_type") != "user":
         return None
-    text = json.loads(message["content"]).get("text", "")
+    content = json.loads(message["content"])
+    attachments = []
+    text = content.get("text", "")
+    if kind == "image":
+        attachments.append({"image_key": content["image_key"], "message_id": message["message_id"]})
+    elif kind == "post":
+        if "content" not in content:
+            content = content.get("zh_cn") or content.get("en_us") or next(iter(content.values()), {})
+        paragraphs = [content["title"]] if content.get("title") else []
+        for row in content.get("content", []):
+            paragraphs.append("".join(str(part.get("text", "")) for part in row if part.get("tag") in ("text", "a")))
+            for part in row:
+                if part.get("tag") == "img" and part.get("image_key"):
+                    attachments.append({"image_key": part["image_key"], "message_id": message["message_id"]})
+        text = "\n".join(paragraphs)
     for mention in message.get("mentions") or []:
         text = text.replace(mention["key"], "@" + mention.get("name", ""))
-    if not text.strip():
+    if not (text.strip() or attachments):
         return None
-    return (message["message_id"], sender["sender_id"]["open_id"], text,
-            int(message["create_time"]) / 1000, {"message_id": message["message_id"]})
+    result = (message["message_id"], sender["sender_id"]["open_id"], text,
+              int(message["create_time"]) / 1000, {"message_id": message["message_id"]})
+    return result + (attachments,) if attachments else result
 
 
 def run_telegram(config, store):
@@ -304,7 +464,8 @@ def run_telegram(config, store):
     me = call("getMe")
     if call("getWebhookInfo").get("url"):
         raise BridgeError("Telegram bot already uses a webhook; use a separate bot or remove it yourself")
-    bridge = Bridge(config, "telegram", store, send)
+    bridge = Bridge(config, "telegram", store, send,
+                    ImageDownloader("telegram", config["telegram"], http_json))
     start_worker(bridge)
     offset_key = f'telegram_offset_{me["id"]}'
     offset = int(store.get_meta(offset_key))
@@ -338,7 +499,8 @@ def run_dingtalk(config, store):
         if result.get("errcode") != 0:
             raise BridgeError(f'DingTalk reply error {result.get("errcode")}')
 
-    bridge = Bridge(config, "dingtalk", store, send)
+    bridge = Bridge(config, "dingtalk", store, send,
+                    ImageDownloader("dingtalk", config["dingtalk"], http_json))
 
     class Handler(ding.ChatbotHandler):
         async def process(self, callback):
@@ -373,6 +535,7 @@ def run_feishu(config, store):
             bridge.receive(*parsed)
 
     client = Client(config["feishu"], http_json, handler)
+    bridge.downloader = ImageDownloader("feishu", config["feishu"], http_json, client)
     start_worker(bridge)
     asyncio.run(client.run())
 
@@ -454,8 +617,11 @@ def main():
     for handler in logging.getLogger().handlers:
         handler.addFilter(Redact())
     if args.check:
-        FNS(config["fns"]).check()
-        LOG.info("FNS read access OK; vault=%s (write permission not tested)", config["fns"]["vault"])
+        fns = FNS(config["fns"])
+        fns.check()
+        if config.get("images", {}).get("enabled", True):
+            fns.call("GET", "files", params={"vault": config["fns"]["vault"], "pageSize": 1})
+        LOG.info("FNS read access OK; vault=%s (note/file write permissions not tested)", config["fns"]["vault"])
         return
     state_dir = Path(config.get("capture", {}).get("state_dir", "state"))
     state_dir.mkdir(parents=True, exist_ok=True)

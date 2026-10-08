@@ -2,7 +2,7 @@
 url = "https://fns.example.com"
 vault = "your-vault"
 # 在 FNS 管理后台生成独立 API Token，协议 rest，客户端 fns-message-bridge，
-# 功能 note_r,note_w，限制目标仓库。不要填网页登录 Token。
+# 功能 note_r,note_w,file_r,file_w，限制目标仓库。不要填网页登录 Token。
 token = ""
 client = "fns-message-bridge"
 
@@ -10,6 +10,13 @@ client = "fns-message-bridge"
 folder = "Inbox"
 timezone = "Asia/Shanghai"
 state_dir = "/data"
+
+[images]
+# 旧配置不添加这一段也默认启用；无 OCR，不做压缩或格式转换。
+enabled = true
+# MiB；下载和上传均流式处理，超限拒绝保存。
+max_size_mb = 5
+max_per_message = 10
 
 [telegram]
 enabled = false
@@ -21,6 +28,8 @@ allowed_users = []
 enabled = false
 client_id = ""
 client_secret = ""
+# 一般从消息回调获取，可留空；如下载失败，可填后台机器人 robotCode。
+robot_code = ""
 # 优先使用 senderStaffId；发 身份 给机器人查询。
 allowed_users = []
 

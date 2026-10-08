@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && useradd --uid 10001 --gid bridge --no-create-home bridge \
     && mkdir -p /data \
     && chown bridge:bridge /data
-COPY bridge.py feishu_lite.py ./
+COPY bridge.py feishu_lite.py media.py ./
 USER 10001:10001
 ENTRYPOINT ["python", "/app/bridge.py", "--config", "/config/config.toml"]
 CMD ["--all"]
